@@ -1,0 +1,23 @@
+{
+  "mode": "nfm",
+  "default_squelch": 0.02,
+  "default_gain": null,
+  "nfm_deviation_hz": 2500,
+  "presets": {
+    "navfire": {
+      "mhz": 154.1075
+    },
+    "navmed": {
+      "mhz": 154.235
+    },
+    "fg1": {
+      "mhz": 155.4
+    },
+    "fg2": {
+      "mhz": 155.295
+    },
+    "so1": {
+      "mhz": 155.1
+    }
+  }
+}
