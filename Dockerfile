@@ -43,6 +43,7 @@ RUN python3 -m venv /opt/venv && \
     /opt/venv/bin/python -m pip install --no-cache-dir \
         "discord.py[voice]>=2.4,<3.0" \
         "aiohttp>=3.8.5,<3.9" \
+        "numpy==1.26.4" \
         pynacl
 
 # ---- App files ----
