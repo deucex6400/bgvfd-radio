@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# BGVFD Radio Bot — unified NFM/WFM/WX with quieting tweaks
+# BGVFD Radio Bot — unified NFM/WFM/WX with quieting tweaks (FIXED xlating wiring)
 # - Lower default RF gain
 # - NFM voice: tighter RF LPF (5 kHz / 3 kHz)
 # - WX mode: +250 kHz tuner offset + freq_xlating FIR (12 kHz / 8 kHz)
 # - Proper DC blocker from gnuradio.blocks (fallback HPF)
 # - AGC references lowered (0.2) to avoid boosting idle noise
 # - Audio limiter before int16 conversion (±0.5 FS)
+# - FIX: Avoid "destination already in use" by wiring xlating FIR only in tune() and disconnecting prior edges
 
 import sys
 import os
@@ -31,9 +32,6 @@ import osmosdr
 # -------------------- Config loading --------------------
 
 def _load_config():
-    """Load presets/config from env PRESETS_JSON or /opt/presets.json.
-    Supports standard JSON or single-quoted JSON-like strings inside double quotes.
-    """
     cfg = None
     env = os.environ.get('PRESETS_JSON')
     if env:
@@ -51,13 +49,11 @@ def _load_config():
             except Exception as e:
                 print('WARN: Failed to read /opt/presets.json:', e)
     if cfg is None:
-        # Fallback defaults tuned for quieter NFM monitoring and NOAA WX
         cfg = {
             'mode': 'nfm',
-            'default_squelch': 0.12,   # reasonable starting point
+            'default_squelch': 0.12,
             'default_gain': None,
-            'nfm_deviation_hz': 5000,  # increases demod headroom (lower idle hiss)
-            # Optional: add "ppm": 2 if you want correction from rtl_test -p
+            'nfm_deviation_hz': 5000,
             'presets': {
                 'wx6':     {'mhz': 162.5250, 'squelch': 0.20},
                 'navfire': {'mhz': 154.1075},
@@ -75,7 +71,6 @@ CONFIG = _load_config()
 
 def make_source(sample_rate, center_freq=88_500_000):
     src = osmosdr.source(args='rtl=0')
-    # Optional PPM correction
     try:
         ppm = int(CONFIG.get('ppm', 0))
         if ppm:
@@ -101,7 +96,7 @@ def make_source(sample_rate, center_freq=88_500_000):
         except Exception:
             pass
     else:
-        src.set_gain(18.0)  # gentler default
+        src.set_gain(18.0)
     return src
 
 
@@ -150,8 +145,8 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
         self.buffer = []
         self.buffer_len = 0
         self.playback_started = False
-        self.min_buffer = int(48000 * 2 * 2 * 0.06)  # ~60ms priming
-        self.playback_length = int(48000 * 2 * 2 * 0.02)  # ~20ms chunks
+        self.min_buffer = int(48000 * 2 * 2 * 0.06)
+        self.playback_length = int(48000 * 2 * 2 * 0.02)
         self.dtype = numpy.dtype('int16')
         self.dtype_i = numpy.iinfo(self.dtype)
         self.dtype_abs_max = 2 ** (self.dtype_i.bits - 1)
@@ -178,12 +173,11 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
 
     def _convert(self, f):
         f = numpy.asarray(f)
-        # Gentle limiter so idle doesn’t occupy half-scale
         f = numpy.clip(f, -0.5, 0.5)
         f = f * self.dtype_abs_max
         f = f.clip(self.dtype_i.min, self.dtype_i.max)
         f = f.astype(self.dtype)
-        f = f.repeat(2)  # mono -> stereo
+        f = f.repeat(2)
         return f.tobytes()
 
     def read(self):
@@ -214,17 +208,14 @@ class RadioBlock(gnuradio.gr.top_block):
     def __init__(self):
         gnuradio.gr.top_block.__init__(self, "Discord Radio")
         self._running = False
-        # Rates optimized for RTL‑SDR Blog V4 / R828D
         self.source_sample_rate = 2_048_000
         self.audio_sample_rate = 48_000
         self.mid_rate = 256_000
-        self.out_rate = self.mid_rate // 4  # 64 kHz
+        self.out_rate = self.mid_rate // 4
         self.nfm_deviation_hz = int(CONFIG.get('nfm_deviation_hz', 5000))
-        # Blocks
         self.source = make_source(self.source_sample_rate)
         self.capture_block = CaptureBlock()
         self.mode = str(CONFIG.get('mode', 'nfm')).lower()
-        # WX offset parameters
         self.wx_offset_hz = 250_000
         self.chan = None
         self._build_chain()
@@ -237,41 +228,32 @@ class RadioBlock(gnuradio.gr.top_block):
 
     def _build_chain(self):
         self._disconnect_all()
-        # 2.048 MS/s -> 256 kS/s (complex)
         self.resamp1 = make_resampler_ccc(1, 8)
-        # Complex AGC (quiet references)
         self.agc_c = gnuradio.analog.agc2_cc(attack_rate=5e-4, decay_rate=5e-3, reference=0.2, gain=1.0)
         self.connect((self.source, 0), (self.resamp1, 0))
         self.connect((self.resamp1, 0), (self.agc_c, 0))
 
         if self.mode == 'wfm':
-            # WFM: demod at 256 k -> 64 k audio -> resample to 48 k
             self.wfm = make_wfm(self.mid_rate, 4)
-            self.resamp2 = make_resampler_fff(3, 4)  # 64k -> 48k
+            self.resamp2 = make_resampler_fff(3, 4)
             self.connect((self.agc_c, 0), (self.wfm, 0))
             self.connect((self.wfm, 0), (self.resamp2, 0))
             self.connect((self.resamp2, 0), (self.capture_block, 0))
 
         elif self.mode == 'wx':
-            # NOAA WX: freq-translating FIR to avoid DC, wider RF channel, then demod
+            # Build WX demod chain but connect AGC -> QUAD first; xlating FIR is inserted by tune()
             self.quad_demod = make_nfm_quadrature_demod(self.mid_rate, self.nfm_deviation_hz)
-            self.decim4 = make_resampler_fff(1, 4)  # 256k -> 64k
-            # DC blocker (blocks) or HPF fallback
+            self.decim4 = make_resampler_fff(1, 4)
             try:
                 self.dc_block = blocks.dc_blocker_ff(64, True)
             except Exception:
                 hp_taps = firdes.high_pass(1.0, self.out_rate, 5.0, 5.0, window.WIN_HAMMING, 6.76)
                 self.dc_block = gnuradio.filter.fir_filter_fff(1, hp_taps)
-            # Float AGC after DC removal
             self.agc_f = gnuradio.analog.agc2_ff(attack_rate=5e-4, decay_rate=5e-3, reference=0.2, gain=1.0)
-            # Audio LPF at 5 kHz for WX
             self.audio_lpf = gnuradio.filter.fir_filter_fff(1, firdes.low_pass(1.0, self.out_rate, 5000, 2000, window.WIN_HAMMING, 6.76))
-            self.resamp2 = make_resampler_fff(3, 4)  # 64k -> 48k
-            # Insert xlating FIR (shift set in tune())
-            taps = firdes.low_pass(1.0, self.mid_rate, 12_000, 8_000, window.WIN_HAMMING, 6.76)
-            self.chan = gnuradio.filter.freq_xlating_fir_filter_ccf(1, taps, -self.wx_offset_hz, self.mid_rate)
-            self.connect((self.agc_c, 0), (self.chan, 0))
-            self.connect((self.chan, 0), (self.quad_demod, 0))
+            self.resamp2 = make_resampler_fff(3, 4)
+            # Initial wiring (no xlating yet): AGC -> QUAD
+            self.connect((self.agc_c, 0), (self.quad_demod, 0))
             self.connect((self.quad_demod, 0), (self.decim4, 0))
             self.connect((self.decim4, 0), (self.dc_block, 0))
             self.connect((self.dc_block, 0), (self.agc_f, 0))
@@ -280,20 +262,18 @@ class RadioBlock(gnuradio.gr.top_block):
             self.connect((self.resamp2, 0), (self.capture_block, 0))
 
         else:
-            # NFM voice chain
+            # NFM voice
             self.chan_lpf = make_channel_lpf(self.mid_rate, cutoff_hz=5_000, trans_hz=3_000)
             self.quad_demod = make_nfm_quadrature_demod(self.mid_rate, self.nfm_deviation_hz)
-            self.decim4 = make_resampler_fff(1, 4)  # 256k -> 64k
-            # DC blocker (blocks) or HPF fallback
+            self.decim4 = make_resampler_fff(1, 4)
             try:
                 self.dc_block = blocks.dc_blocker_ff(64, True)
             except Exception:
                 hp_taps = firdes.high_pass(1.0, self.out_rate, 5.0, 5.0, window.WIN_HAMMING, 6.76)
                 self.dc_block = gnuradio.filter.fir_filter_fff(1, hp_taps)
-            # Float AGC (quiet)
             self.agc_f = gnuradio.analog.agc2_ff(attack_rate=5e-4, decay_rate=5e-3, reference=0.2, gain=1.0)
             self.audio_lpf = make_audio_lpf(self.out_rate, cutoff_hz=3500, trans_hz=1500)
-            self.resamp2 = make_resampler_fff(3, 4)  # 64k -> 48k
+            self.resamp2 = make_resampler_fff(3, 4)
             self.connect((self.agc_c, 0), (self.chan_lpf, 0))
             self.connect((self.chan_lpf, 0), (self.quad_demod, 0))
             self.connect((self.quad_demod, 0), (self.decim4, 0))
@@ -303,7 +283,6 @@ class RadioBlock(gnuradio.gr.top_block):
             self.connect((self.audio_lpf, 0), (self.resamp2, 0))
             self.connect((self.resamp2, 0), (self.capture_block, 0))
 
-    # --- Running state helpers ---
     def start(self):
         try:
             super(RadioBlock, self).start()
@@ -330,32 +309,32 @@ class RadioBlock(gnuradio.gr.top_block):
         return True
 
     def _install_xlating(self, shift_hz, cutoff_hz, trans_hz):
-        # Rebuild xlating FIR with given shift
+        # Disconnect any existing input into quad_demod
+        for edge in [((self.agc_c, 0), (self.quad_demod, 0)), ((self.chan, 0), (self.quad_demod, 0))]:
+            try:
+                self.disconnect(*edge)
+            except Exception:
+                pass
+        # Disconnect prior AGC->chan if present
         try:
             if self.chan is not None:
                 self.disconnect((self.agc_c, 0), (self.chan, 0))
         except Exception:
             pass
+        # Build a new xlating FIR and wire AGC->CHAN->QUAD
         taps = firdes.low_pass(1.0, self.mid_rate, cutoff_hz, trans_hz, window.WIN_HAMMING, 6.76)
         self.chan = gnuradio.filter.freq_xlating_fir_filter_ccf(1, taps, shift_hz, self.mid_rate)
         self.connect((self.agc_c, 0), (self.chan, 0))
-        # Ensure downstream wiring
-        try:
-            self.disconnect((self.agc_c, 0), (self.quad_demod, 0))
-        except Exception:
-            pass
         self.connect((self.chan, 0), (self.quad_demod, 0))
 
     def tune(self, freq_hz: int):
         target = int(freq_hz)
         print(f"[RADIO] Tuning to {target/1_000_000:.6f} MHz (mode={self.mode.upper()})")
-        # Temporarily relax bandwidth during lock
         try:
             self.source.set_bandwidth(0, 0)
         except Exception:
             pass
         if self.mode == 'wx':
-            # Offset the tuner by +offset to avoid DC, then translate back
             tuned_center = target + self.wx_offset_hz
             try:
                 self.source.set_center_freq(tuned_center); time.sleep(0.12)
@@ -364,7 +343,6 @@ class RadioBlock(gnuradio.gr.top_block):
                 self.source.set_center_freq(tuned_center); time.sleep(0.15)
             except Exception:
                 pass
-            # Readback retries
             for _ in range(4):
                 try:
                     tuned = int(self.source.get_center_freq())
@@ -376,7 +354,6 @@ class RadioBlock(gnuradio.gr.top_block):
                     self.source.set_center_freq(tuned_center); time.sleep(0.10)
                 except Exception:
                     pass
-            # Restore modest BW
             try:
                 self.source.set_bandwidth(1_200_000, 0)
             except Exception:
@@ -384,7 +361,6 @@ class RadioBlock(gnuradio.gr.top_block):
             # Install translating FIR to bring target back to baseband
             self._install_xlating(shift_hz=-self.wx_offset_hz, cutoff_hz=12_000, trans_hz=8_000)
         else:
-            # Regular tune without offset
             try:
                 self.source.set_center_freq(target); time.sleep(0.06)
                 self.source.set_center_freq(target + 50_000); time.sleep(0.06)
@@ -417,7 +393,7 @@ class RadioBlock(gnuradio.gr.top_block):
         except Exception:
             return -1.0
 
-# -------------------- Discord bot (prefix + slash) --------------------
+# -------------------- Discord bot --------------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord_commands.Bot(
@@ -472,7 +448,6 @@ class BotCommands(discord_commands.Cog):
             f"→ radio reports {self.radio.get_center_mhz():.6f} MHz"
         )
 
-    # --- Prefix commands ---
     @discord_commands.command()
     async def wx(self, ctx):
         self.radio.set_mode('wx')
@@ -575,7 +550,6 @@ class BotCommands(discord_commands.Cog):
             if ctx.voice_client:
                 await ctx.voice_client.disconnect()
 
-# --- Basic error handler ---
 @bot.event
 async def on_command_error(ctx, error):
     msg = f"Command error: {error}"
@@ -585,7 +559,6 @@ async def on_command_error(ctx, error):
         pass
     print(msg)
 
-# --- setup_hook ---
 @bot.event
 async def setup_hook():
     bot.radio = RadioBlock()
@@ -597,7 +570,6 @@ async def setup_hook():
         await bot.tree.sync()
         print("Slash commands synced globally (may take up to an hour to appear)")
 
-# -------------------- Main --------------------
 if __name__ == '__main__':
     token = None
     if len(sys.argv) >= 2:
@@ -605,6 +577,6 @@ if __name__ == '__main__':
     else:
         token = os.environ.get('DISCORD_TOKEN')
     if not token:
-        print('Usage: stereo_fm.unified.py <DISCORD_BOT_TOKEN> (or set DISCORD_TOKEN env)')
+        print('Usage: stereo_fm.unified.fixed.py <DISCORD_BOT_TOKEN> (or set DISCORD_TOKEN env)')
         sys.exit(2)
     bot.run(token)
