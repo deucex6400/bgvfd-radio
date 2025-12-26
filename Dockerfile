@@ -15,11 +15,11 @@ RUN apt-get update -q && \
       rtl-sdr usbutils && \
     apt-get clean && apt-get autoclean
 
-# Optional: VOLK profile
+# Optional: VOLK profile at build time
 ARG run_volk_profile
 RUN if [ -n "$run_volk_profile" ] ; then volk_profile ; fi
 
-# pip tooling + discord.py 2.x without [voice] extra; aiohttp pinned to 3.7.4.post0
+# pip tooling + discord.py 2.x (no [voice] extra; OS provides PyNaCl/CFFI)
 RUN python3 -m pip install --upgrade pip setuptools wheel
 RUN python3 -m pip install 'discord.py>=2.6.0' 'aiohttp==3.7.4.post0'
 
