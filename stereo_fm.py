@@ -150,8 +150,19 @@ class RadioBlock(gnuradio.gr.top_block):
 
 
 
-bot = discord_commands.Bot(command_prefix=discord_commands.when_mentioned_or('!'),
-                           description='Radio bot')
+
+# NEW: declare intents (near your other imports)
+intents = discord.Intents.default()
+
+# If you still use '!' prefix commands, enable message content intent:
+intents.message_content = True  # not required for slash commands
+
+# Existing Bot construction: add intents=intents
+bot = discord_commands.Bot(
+    command_prefix=discord_commands.when_mentioned_or('!'),
+    description='Radio bot with slash commands',
+    intents=intents,  # <-- REQUIRED in discord.py v2+
+    description='BGVFD Radio bot')
 
 
 @bot.event
