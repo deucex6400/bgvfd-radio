@@ -29,8 +29,8 @@ def make_resampler(num, denom):
     return gnuradio.filter.rational_resampler_ccc(
         interpolation=num,
         decimation=denom,
-        taps=None,
-        fractional_bw=None,
+        taps=[],
+        fractional_bw=0.0,
     )
 
 
@@ -38,8 +38,8 @@ def make_resampler_r(num, denom):
     return gnuradio.filter.rational_resampler_fff(
         interpolation=num,
         decimation=denom,
-        taps=None,
-        fractional_bw=None,
+        taps=[],
+        fractional_bw=0.0,
     )
 
 
