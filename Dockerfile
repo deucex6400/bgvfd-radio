@@ -43,7 +43,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # ---- App files ----
 WORKDIR /opt
 ADD stereo_fm.py /opt/stereo_fm.py
-ADD presets.json /opt/presets.json   # ✅ baked into image
+ADD presets.json /opt/presets.json
 
 # ---- GNU Radio runtime tuning ----
 ENV GR_VMCIRCBUF_IMPLEMENTATION=malloc \
