@@ -2,16 +2,16 @@
 #!/usr/bin/env python3
 # Stereo/VHF Radio Discord Bot — prefix + slash commands
 # Patched for RTL-SDR Blog V4 / R828D:
-#   - vmcircbuf env suppression
-#   - V4-friendly sample rates (2.048 MS/s -> 256 kS/s -> 64 k -> 48 k)
-#   - robust tune() (offset hops, settle, retries, modest BW restore)
-#   - prefix presets fix (self.PRESETS)
-#   - prefix utilities: !mode, !bw, !rfinfo
-#   - internal run-state tracking (no GNURadio is_running())
+# - vmcircbuf env suppression
+# - V4-friendly sample rates (2.048 MS/s -> 256 kS/s -> 64 k -> 48 k)
+# - robust tune() (offset hops, settle, retries, modest BW restore)
+# - prefix presets fix (self.PRESETS)
+# - prefix utilities: !mode, !bw, !rfinfo
+# - internal run-state tracking (no GNURadio is_running())
+# - QUIET PATCH: lower default RF gain, tighter NFM RF LPF, higher default deviation, modest BW
 
 import sys
 import os
-
 # --- GNU Radio runtime: force a stable, portable circular buffer and reduce log noise ---
 os.environ.setdefault('GR_VMCIRCBUF_IMPLEMENTATION', 'malloc')
 os.environ.setdefault('GR_CONSOLE_LOG_ENABLE', '0')
@@ -22,7 +22,6 @@ import numpy
 import discord
 from discord.ext import commands as discord_commands
 from discord import app_commands
-
 import gnuradio
 import gnuradio.analog
 import gnuradio.audio
@@ -33,6 +32,7 @@ from gnuradio.fft import window
 import osmosdr
 
 # -------------------- Config loading --------------------
+
 def _load_config():
     """Load presets/config from env PRESETS_JSON or /opt/presets.json.
     Supports standard JSON or single-quoted JSON-like strings inside double quotes.
@@ -54,11 +54,12 @@ def _load_config():
             except Exception as e:
                 print('WARN: Failed to read /opt/presets.json:', e)
     if cfg is None:
+        # Fallback defaults tuned for quieter NFM monitoring
         cfg = {
             'mode': 'nfm',
-            'default_squelch': 0.02,
+            'default_squelch': 0.10,   # was 0.02; higher to suppress idle hiss
             'default_gain': None,
-            'nfm_deviation_hz': 2500,
+            'nfm_deviation_hz': 5000,  # was 2500; increases demod scaling headroom (lower output noise)
             # Optional: add "ppm": 2 if you want a tiny correction from rtl_test -p
             'presets': {
                 'navfire': {'mhz': 154.1075},
@@ -73,9 +74,9 @@ def _load_config():
 CONFIG = _load_config()
 
 # -------------------- GNU Radio helper blocks --------------------
+
 def make_source(sample_rate, center_freq=88_500_000):
     src = osmosdr.source(args='rtl=0')
-
     # Optional PPM correction measured via `rtl_test -p`
     ppm = int(CONFIG.get('ppm', 0))
     try:
@@ -83,7 +84,6 @@ def make_source(sample_rate, center_freq=88_500_000):
             src.set_freq_corr(ppm, 0)
     except Exception:
         pass
-
     src.set_freq_corr(0, 0)
     src.set_dc_offset_mode(0, 0)
     src.set_iq_balance_mode(0, 0)
@@ -91,19 +91,16 @@ def make_source(sample_rate, center_freq=88_500_000):
     src.set_if_gain(20, 0)
     src.set_bb_gain(20, 0)
     src.set_antenna("", 0)
-
     # Gentle bring-up for R82xx/R828D
     try:
         src.set_center_freq(center_freq)
         time.sleep(0.05)
         # Friendlier default bandwidth for VHF public safety
-        src.set_bandwidth(1_200_000, 0)
+        src.set_bandwidth(600_000, 0)  # was 1_200_000
         time.sleep(0.05)
     except Exception:
         pass
-
     src.set_sample_rate(sample_rate)
-
     default_gain = CONFIG.get('default_gain')
     if default_gain is not None:
         try:
@@ -112,7 +109,7 @@ def make_source(sample_rate, center_freq=88_500_000):
             pass
     else:
         # Start moderate; user can adjust via commands
-        src.set_gain(29.7)
+        src.set_gain(18.0)  # was 29.7
     return src
 
 def make_resampler_ccc(num, denom):
@@ -153,7 +150,7 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
         self.buffer = []
         self.buffer_len = 0
         self.playback_started = False
-        self.min_buffer = int(48000 * 2 * 2 * 0.06)    # ~60ms priming
+        self.min_buffer = int(48000 * 2 * 2 * 0.06)  # ~60ms priming
         self.playback_length = int(48000 * 2 * 2 * 0.02)  # ~20ms chunks
         self.dtype = numpy.dtype('int16')
         self.dtype_i = numpy.iinfo(self.dtype)
@@ -214,22 +211,18 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
 class RadioBlock(gnuradio.gr.top_block):
     def __init__(self):
         gnuradio.gr.top_block.__init__(self, "Discord Radio")
-
         # Track running state ourselves (GR's top_block may not expose is_running())
         self._running = False
-
         # Rates optimized for RTL‑SDR Blog V4 / R828D on Pi 5
         self.source_sample_rate = 2_048_000
-        self.audio_sample_rate  = 48_000
-        self.wfm_sample_rate    = 256_000
-        self.wfm_output_rate    = self.wfm_sample_rate // 4  # 64 kHz
-        self.nfm_deviation_hz   = int(CONFIG.get('nfm_deviation_hz', 2500))
-
+        self.audio_sample_rate = 48_000
+        self.wfm_sample_rate = 256_000
+        self.wfm_output_rate = self.wfm_sample_rate // 4  # 64 kHz
+        self.nfm_deviation_hz = int(CONFIG.get('nfm_deviation_hz', 5000))  # was 2500
         # Blocks
         self.source = make_source(self.source_sample_rate)
         self.capture_block = CaptureBlock()
         self.mode = str(CONFIG.get('mode', 'nfm')).lower()
-
         # Build initial chain per mode
         self._build_chain()
 
@@ -241,10 +234,8 @@ class RadioBlock(gnuradio.gr.top_block):
 
     def _build_chain(self):
         self._disconnect_all()
-
         # 2.048 MS/s -> 256 kS/s (complex) via integer decimation 8
         self.resamp1 = make_resampler_ccc(1, 8)
-
         if self.mode == 'wfm':
             # WFM: demod at 256 k -> 64 k audio -> resample to 48 k
             self.wfm = make_wfm(self.wfm_sample_rate, 4)
@@ -255,19 +246,18 @@ class RadioBlock(gnuradio.gr.top_block):
             self.connect((self.resamp2, 0), (self.capture_block, 0))
         else:
             # NFM chain: channel LPF -> quadrature demod -> decimate x4 -> audio LPF -> resample
-            self.chan_lpf   = make_channel_lpf(self.wfm_sample_rate, cutoff_hz=6_000,  trans_hz=6_000)
+            self.chan_lpf = make_channel_lpf(self.wfm_sample_rate, cutoff_hz=5_000, trans_hz=3_000)  # was 6k/6k
             self.quad_demod = make_nfm_quadrature_demod(self.wfm_sample_rate, self.nfm_deviation_hz)
-            self.decim4     = make_resampler_fff(1, 4)       # 256k -> 64k
-            self.audio_lpf  = make_audio_lpf(self.wfm_output_rate, cutoff_hz=3500, trans_hz=1500)
-            self.resamp2    = make_resampler_fff(3, 4)       # 64k -> 48k
-
-            self.connect((self.source,   0), (self.resamp1,   0))
-            self.connect((self.resamp1,  0), (self.chan_lpf,  0))
+            self.decim4 = make_resampler_fff(1, 4)  # 256k -> 64k
+            self.audio_lpf = make_audio_lpf(self.wfm_output_rate, cutoff_hz=3500, trans_hz=1500)
+            self.resamp2 = make_resampler_fff(3, 4)  # 64k -> 48k
+            self.connect((self.source, 0), (self.resamp1, 0))
+            self.connect((self.resamp1, 0), (self.chan_lpf, 0))
             self.connect((self.chan_lpf, 0), (self.quad_demod,0))
-            self.connect((self.quad_demod,0), (self.decim4,   0))
-            self.connect((self.decim4,   0), (self.audio_lpf, 0))
-            self.connect((self.audio_lpf,0), (self.resamp2,   0))
-            self.connect((self.resamp2,  0), (self.capture_block, 0))
+            self.connect((self.quad_demod,0), (self.decim4, 0))
+            self.connect((self.decim4, 0), (self.audio_lpf, 0))
+            self.connect((self.audio_lpf,0), (self.resamp2, 0))
+            self.connect((self.resamp2, 0), (self.capture_block, 0))
 
     # --- Running state helpers (avoid relying on GR's internal methods) ---
     def start(self):
@@ -307,22 +297,19 @@ class RadioBlock(gnuradio.gr.top_block):
             print(f"[RADIO] Tuning to {target/1_000_000:.6f} MHz")
         except Exception:
             pass
-
         # Temporarily relax bandwidth during lock (auto)
         try:
             self.source.set_bandwidth(0, 0)
         except Exception:
             pass
-
         # Wider multi-step with longer settle times: f -> f+50k -> f-25k -> f
         try:
-            self.source.set_center_freq(target);             time.sleep(0.06)
-            self.source.set_center_freq(target + 50_000);    time.sleep(0.06)
-            self.source.set_center_freq(target - 25_000);    time.sleep(0.06)
-            self.source.set_center_freq(target);             time.sleep(0.12)
+            self.source.set_center_freq(target); time.sleep(0.06)
+            self.source.set_center_freq(target + 50_000); time.sleep(0.06)
+            self.source.set_center_freq(target - 25_000); time.sleep(0.06)
+            self.source.set_center_freq(target); time.sleep(0.12)
         except Exception:
             pass
-
         # Retry: read back center freq and nudge if needed
         for _ in range(3):
             try:
@@ -335,10 +322,9 @@ class RadioBlock(gnuradio.gr.top_block):
                 self.source.set_center_freq(target); time.sleep(0.08)
             except Exception:
                 pass
-
         # Restore a modest bandwidth for VHF public safety
         try:
-            self.source.set_bandwidth(1_200_000, 0)
+            self.source.set_bandwidth(600_000, 0)  # was 1_200_000
         except Exception:
             pass
 
@@ -355,7 +341,6 @@ class RadioBlock(gnuradio.gr.top_block):
 # -------------------- Discord bot (prefix + slash) --------------------
 intents = discord.Intents.default()
 intents.message_content = True  # needed for prefix commands
-
 bot = discord_commands.Bot(
     command_prefix=discord_commands.when_mentioned_or('!'),
     description='BGVFD Radio Bot',
@@ -369,9 +354,9 @@ GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID and GUILD_ID.isdigit() 
 @bot.event
 async def on_ready():
     print(f"Logged on as {bot.user} (latency ~{bot.latency*1000:.1f} ms) "
-          f"mode={CONFIG.get('mode','nfm')} dev={CONFIG.get('nfm_deviation_hz',2500)} Hz")
+          f"mode={CONFIG.get('mode','nfm')} dev={CONFIG.get('nfm_deviation_hz',5000)} Hz")
 
-# -------- Prefix Cog --------
+# ------- Prefix Cog -------
 class BotCommands(discord_commands.Cog):
     def __init__(self, bot, radio):
         self.bot = bot
@@ -379,9 +364,9 @@ class BotCommands(discord_commands.Cog):
         # FIX: assign presets to self
         self.PRESETS = {
             k: {
-                'mhz':     float(v.get('mhz')),
+                'mhz': float(v.get('mhz')),
                 'squelch': float(v.get('squelch', CONFIG.get('default_squelch', 0.0))),
-                'gain':    v.get('gain',    CONFIG.get('default_gain', None)),
+                'gain': v.get('gain', CONFIG.get('default_gain', None)),
             } for k, v in CONFIG.get('presets', {}).items()
         }
 
@@ -466,7 +451,7 @@ class BotCommands(discord_commands.Cog):
     async def mode(self, ctx, name: str):
         """
         Switch demodulation mode via prefix. Usage:
-          !mode nfm   or   !mode wfm
+        !mode nfm or !mode wfm
         """
         name = str(name).strip().lower()
         if name not in ('nfm', 'wfm'):
@@ -480,7 +465,7 @@ class BotCommands(discord_commands.Cog):
     @discord_commands.command()
     async def bw(self, ctx, hz: int):
         """
-        Set tuner front-end bandwidth (Hz). Example: !bw 1200000
+        Set tuner front-end bandwidth (Hz). Example: !bw 600000
         Useful to tighten or relax RF front-end filtering.
         """
         try:
@@ -541,12 +526,12 @@ class BotCommands(discord_commands.Cog):
         prefix_cmds = [
             "!join #channel",
             "!fm <MHz>",
-            "!navfire  !navmed  !fg1  !fg2  !so1",
+            "!navfire !navmed !fg1 !fg2 !so1",
             "!vol <0.0-2.0>",
             "!squelch <level>",
             "!gain <dB>",
             "!listpresets",
-            "!mode <nfm|wfm>",
+            "!mode <nfm\nwfm>",
             "!bw <Hz>",
             "!rfinfo",
             "!stop",
@@ -610,9 +595,9 @@ async def preset_slash(interaction: discord.Interaction, name: app_commands.Choi
     key = name.value
     cfg = {
         k: {
-            'mhz':     float(v.get('mhz')),
+            'mhz': float(v.get('mhz')),
             'squelch': float(v.get('squelch', CONFIG.get('default_squelch', 0.0))),
-            'gain':    v.get('gain',    CONFIG.get('default_gain', None)),
+            'gain': v.get('gain', CONFIG.get('default_gain', None)),
         } for k, v in CONFIG.get('presets', {}).items()
     }
     if key not in cfg:
