@@ -1,9 +1,9 @@
-
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
+# Base GNU Radio + SDR + build tooling
 RUN apt-get update -q && \
     apt-get install -y -q --no-install-recommends \
       git ca-certificates cmake build-essential pkg-config \
@@ -15,22 +15,21 @@ RUN apt-get update -q && \
       rtl-sdr usbutils && \
     apt-get clean && apt-get autoclean
 
+# Optional: VOLK profile
 ARG run_volk_profile
 RUN if [ -n "$run_volk_profile" ] ; then volk_profile ; fi
 
-# Keep pip tooling current
+# pip tooling + discord.py 2.x without [voice] extra; aiohttp pinned to 3.7.4.post0
 RUN python3 -m pip install --upgrade pip setuptools wheel
+RUN python3 -m pip install 'discord.py>=2.6.0' 'aiohttp==3.7.4.post0'
 
-# Install discord.py WITHOUT the [voice] extra, and aiohttp explicitly
-RUN python3 -m pip install 'discord.py==1.7.2' 'aiohttp==3.7.4.post0'
-
-# OPTIONAL: sanity check that pip won’t try to install PyNaCl
-RUN python3 -m pip check || true
-
+# App files
 COPY stereo_fm.py /opt/stereo_fm.py
-COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 COPY presets.json /opt/presets.json
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 RUN chmod +x /usr/local/bin/healthcheck.sh
 
+# Healthcheck
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD /usr/local/bin/healthcheck.sh
+
 ENTRYPOINT ["/usr/bin/python3", "/opt/stereo_fm.py"]
