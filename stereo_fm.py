@@ -2,6 +2,7 @@
 #!/usr/bin/env python3
 # Stereo/VHF Radio Discord Bot — prefix + slash commands
 # Patched for RTL-SDR Blog V4 / R828D: vmcircbuf env, preset fix, robust tuning, V4-friendly rates
+# + prefix utilities: !mode, !bw, !rfinfo
 
 import sys
 import os
@@ -53,7 +54,7 @@ def _load_config():
             'default_squelch': 0.02,
             'default_gain': None,
             'nfm_deviation_hz': 2500,
-            # Optional: add "ppm": 2 if you want a tiny correction
+            # Optional: add "ppm": 2 if you want a tiny correction from rtl_test -p
             'presets': {
                 'navfire': {'mhz': 154.1075},
                 'navmed':  {'mhz': 154.2350},
@@ -153,11 +154,21 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
         self.dtype_abs_max = 2 ** (self.dtype_i.bits - 1)
         self.last_rms = 0.0
         self.squelch_threshold = float(CONFIG.get('default_squelch', 0.0))
+        # Light-rate audio RMS debug printing
+        self._last_rms_log = 0.0
 
     def work(self, input_items, output_items):
         f = input_items[0]
         if f.size:
             self.last_rms = float(numpy.sqrt(numpy.mean(numpy.clip(f, -1.0, 1.0) ** 2)))
+            # Debug: print RMS about twice per second while audio is flowing
+            try:
+                now = time.monotonic()
+                if now - self._last_rms_log >= 0.5:
+                    print(f"[AUDIO] RMS={self.last_rms:.4f} (squelch={self.squelch_threshold:.3f})")
+                    self._last_rms_log = now
+            except Exception:
+                pass
             buf = self._convert(f)
             self.buffer_len += len(buf)
             self.buffer.append(buf)
@@ -419,6 +430,46 @@ class BotCommands(discord_commands.Cog):
 
     # --- Prefix: utilities ---
     @discord_commands.command()
+    async def mode(self, ctx, name: str):
+        """
+        Switch demodulation mode via prefix. Usage:
+          !mode nfm   or   !mode wfm
+        """
+        name = str(name).strip().lower()
+        if name not in ('nfm', 'wfm'):
+            return await ctx.send("Mode must be 'nfm' or 'wfm'")
+        ok = self.radio.set_mode(name)
+        if ok:
+            await ctx.send(f"Mode switched to {name.upper()}")
+        else:
+            await ctx.send("Failed to switch mode")
+
+    @discord_commands.command()
+    async def bw(self, ctx, hz: int):
+        """
+        Set tuner front-end bandwidth (Hz). Example: !bw 1200000
+        Useful to tighten or relax RF front-end filtering.
+        """
+        try:
+            hz = int(hz)
+            self.radio.source.set_bandwidth(hz, 0)
+            await ctx.send(f"RF bandwidth set to {hz} Hz")
+        except Exception as e:
+            await ctx.send(f"Failed to set bandwidth: {e}")
+
+    @discord_commands.command()
+    async def rfinfo(self, ctx):
+        """
+        Show current RF center frequency, gain, and squelch.
+        """
+        try:
+            f = float(self.radio.source.get_center_freq())/1_000_000.0
+            g = float(self.radio.source.get_gain())
+            await ctx.send(f"RF Info: center={f:.6f} MHz, gain={g:.1f} dB, squelch={self.radio.capture_block.squelch_threshold:.3f}")
+        except Exception as e:
+            await ctx.send(f"RF Info failed: {e}")
+
+    @discord_commands.command()
     async def vol(self, ctx, level: float):
         vc = ctx.voice_client
         if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
@@ -462,6 +513,9 @@ class BotCommands(discord_commands.Cog):
             "!squelch <level>",
             "!gain <dB>",
             "!listpresets",
+            "!mode <nfm|wfm>",
+            "!bw <Hz>",
+            "!rfinfo",
             "!stop",
         ]
         slash_cmds = [
@@ -480,7 +534,7 @@ class BotCommands(discord_commands.Cog):
             s.append("\n**Slash commands**\n" + "\n".join(slash_cmds))
         return "\n".join(s)
 
-# -------- Slash commands --------
+# -------- Slash commands (still present; may appear after global sync delay) --------
 PRESET_CHOICES = [app_commands.Choice(name=k, value=k) for k in CONFIG.get('presets', {}).keys()]
 
 @bot.tree.command(name="join", description="Join a voice channel")
