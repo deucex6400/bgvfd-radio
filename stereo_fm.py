@@ -4,6 +4,8 @@
 
 import sys
 import os
+os.environ.setdefault('GR_VMCIRCBUF_IMPLEMENTATION', 'malloc')
+os.environ.setdefault('GR_CONSOLE_LOG_ENABLE', '0')
 import time
 import json
 import numpy
