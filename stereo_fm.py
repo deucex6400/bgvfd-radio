@@ -1,8 +1,13 @@
 
 #!/usr/bin/env python3
 # Stereo/VHF Radio Discord Bot — prefix + slash commands
-# Patched for RTL-SDR Blog V4 / R828D: vmcircbuf env, preset fix, robust tuning, V4-friendly rates
-# + prefix utilities: !mode, !bw, !rfinfo
+# Patched for RTL-SDR Blog V4 / R828D:
+#   - vmcircbuf env suppression
+#   - V4-friendly sample rates (2.048 MS/s -> 256 kS/s -> 64 k -> 48 k)
+#   - robust tune() (offset hops, settle, retries, modest BW restore)
+#   - prefix presets fix (self.PRESETS)
+#   - prefix utilities: !mode, !bw, !rfinfo
+#   - internal run-state tracking (no GNURadio is_running())
 
 import sys
 import os
@@ -70,7 +75,8 @@ CONFIG = _load_config()
 # -------------------- GNU Radio helper blocks --------------------
 def make_source(sample_rate, center_freq=88_500_000):
     src = osmosdr.source(args='rtl=0')
-    # If you measured ppm with `rtl_test -p`, you can set it in presets.json as "ppm"
+
+    # Optional PPM correction measured via `rtl_test -p`
     ppm = int(CONFIG.get('ppm', 0))
     try:
         if ppm:
@@ -208,6 +214,10 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
 class RadioBlock(gnuradio.gr.top_block):
     def __init__(self):
         gnuradio.gr.top_block.__init__(self, "Discord Radio")
+
+        # Track running state ourselves (GR's top_block may not expose is_running())
+        self._running = False
+
         # Rates optimized for RTL‑SDR Blog V4 / R828D on Pi 5
         self.source_sample_rate = 2_048_000
         self.audio_sample_rate  = 48_000
@@ -259,11 +269,30 @@ class RadioBlock(gnuradio.gr.top_block):
             self.connect((self.audio_lpf,0), (self.resamp2,   0))
             self.connect((self.resamp2,  0), (self.capture_block, 0))
 
+    # --- Running state helpers (avoid relying on GR's internal methods) ---
+    def start(self):
+        """Start flowgraph and mark running."""
+        try:
+            super(RadioBlock, self).start()
+        finally:
+            self._running = True
+
+    def stop(self):
+        """Stop flowgraph and mark not running."""
+        try:
+            super(RadioBlock, self).stop()
+        finally:
+            self._running = False
+
     def set_mode(self, mode: str):
         m = str(mode).lower()
         if m not in ('nfm', 'wfm'):
             return False
-        was_running = self.is_running()
+        # Our own running flag; don't call GR internals that may not exist.
+        try:
+            was_running = bool(self._running)
+        except Exception:
+            was_running = False
         if was_running:
             self.stop(); self.wait()
         self.mode = m
@@ -312,6 +341,10 @@ class RadioBlock(gnuradio.gr.top_block):
             self.source.set_bandwidth(1_200_000, 0)
         except Exception:
             pass
+
+    def is_running(self) -> bool:
+        """Compatibility helper for older GR builds."""
+        return bool(self._running)
 
     def get_center_mhz(self) -> float:
         try:
