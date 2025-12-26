@@ -150,8 +150,20 @@ class RadioBlock(gnuradio.gr.top_block):
 
 
 
-bot = discord_commands.Bot(command_prefix=discord_commands.when_mentioned_or('!'),
-                           description='Radio bot')
+
+# 1) declare intents (put this above the Bot(...) line)
+intents = discord.Intents.default()
+
+# If you use '!' prefix commands, you must enable message content:
+intents.message_content = True   # required for prefix commands
+
+# 2) pass intents into the bot constructor
+bot = discord_commands.Bot(
+    command_prefix=discord_commands.when_mentioned_or('!'),
+    description='BGVfd Discord Radio Bot',
+    intents=intents              # <-- REQUIRED
+)
+
 
 
 @bot.event
