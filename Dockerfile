@@ -1,16 +1,15 @@
 
-# syntax=docker/dockerfile:1
-# Raspberry Pi 5 / Debian 12 (Bookworm, arm64)
+# syntax=docker/dockerfile:1.4
+# Raspberry Pi 5 (arm64) — Debian 12 (Bookworm)
 FROM debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# ---- GNU Radio / SDR + Python build deps ----
-# Notes:
-# - gnuradio + gr-osmosdr provide the C++ libs and Python bindings via APT (Debian-recommended).
-# - libopus0 + PyNaCl enable Discord voice.
-# - python3-venv for creating a venv (PEP 668: avoid pip in system Python).
+# Use bash for RUN with pipefail (safer)
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# ---- GNU Radio / SDR + Python deps ----
 RUN apt-get update -q && \
     apt-get -y upgrade && \
     apt-get -y install -q --no-install-recommends \
@@ -22,7 +21,7 @@ RUN apt-get update -q && \
         # RTL-SDR runtime/tooling
         librtlsdr0 \
         rtl-sdr \
-        # GNU Radio & osmosdr
+        # GNU Radio + osmosdr (APT provides Python bindings under dist-packages)
         gnuradio \
         gnuradio-dev \
         gr-osmosdr \
@@ -40,8 +39,7 @@ RUN apt-get update -q && \
         python3-numpy \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- Create venv that can see system site-packages (GNU Radio bindings) ----
-# We install your app deps inside the venv, but expose APT-installed GNU Radio via system site-packages.
+# ---- Create venv that can see system site-packages (for GNU Radio bindings) ----
 RUN python3 -m venv /opt/venv --system-site-packages && \
     /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /opt/venv/bin/python -m pip install --no-cache-dir \
@@ -52,17 +50,13 @@ RUN python3 -m venv /opt/venv --system-site-packages && \
 
 # ---- App files ----
 WORKDIR /opt
-# Your bot and presets
 ADD stereo_fm.py /opt/stereo_fm.py
 ADD presets.json /opt/presets.json
 
-# ---- EntryPoint script: discover dist-packages, export PYTHONPATH, run bot ----
-# This script:
-#  1) Sets GR runtime env to silence vmcircbuf.
-#  2) Uses system python to locate the 'gnuradio' module directory.
-#  3) Exports PYTHONPATH accordingly.
-#  4) Launches the bot with the venv Python.
-RUN bash -lc 'cat > /opt/entrypoint.sh << "SH" && chmod +x /opt/entrypoint.sh
+# ---- Create /opt/entrypoint.sh using nested heredocs (BuildKit) ----
+# Outer heredoc: the commands to run when building; inner heredoc: the file content we write.
+RUN <<'CMDS'
+cat > /opt/entrypoint.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -70,9 +64,8 @@ set -euo pipefail
 export GR_VMCIRCBUF_IMPLEMENTATION="${GR_VMCIRCBUF_IMPLEMENTATION:-malloc}"
 export GR_CONSOLE_LOG_ENABLE="${GR_CONSOLE_LOG_ENABLE:-0}"
 
-# Discover the actual dist-packages path where APT installed GNU Radio
-# Fallback to common Debian/Pi ARM64 locations if discovery fails.
-DISCOVERED="$(/usr/bin/python3 - <<PY || true
+# Discover where APT installed GNU Radio's Python package; fallback to common ARM64 paths.
+DISCOVERED="$(/usr/bin/python3 - <<'PY'
 import sys, os
 try:
     import gnuradio
@@ -82,31 +75,30 @@ except Exception:
 PY
 )"
 
-# Build PYTHONPATH with discovered path + sensible defaults
 DEFAULTS="/usr/lib/python3/dist-packages:/usr/lib/aarch64-linux-gnu/python3.11/dist-packages:/usr/lib/aarch64-linux-gnu/python3/dist-packages"
-if [ -n "${DISCOVERED}" ]; then
+
+if [[ -n "${DISCOVERED}" ]]; then
   export PYTHONPATH="${DISCOVERED}:${DEFAULTS}:${PYTHONPATH:-}"
 else
   export PYTHONPATH="${DEFAULTS}:${PYTHONPATH:-}"
 fi
 
-# Log what we decided (one-time, for diagnostics)
 echo "Using PYTHONPATH=${PYTHONPATH}" >&2
 
 # Run the bot from the venv
 exec /opt/venv/bin/python /opt/stereo_fm.py
 SH
-'
+
+chmod +x /opt/entrypoint.sh
+CMDS
 
 # ---- Environment defaults ----
-# Put venv at the front of PATH; keep GNU Radio flags quiet; unbuffer logs.
 ENV PATH="/opt/venv/bin:${PATH}" \
     GR_VMCIRCBUF_IMPLEMENTATION=malloc \
     GR_CONSOLE_LOG_ENABLE=0 \
     PYTHONUNBUFFERED=1
 
-# ---- Build-time sanity check (fail fast if bindings aren't visible) ----
-# Tries both typical dist-packages paths; final runtime still discovers dynamically in entrypoint.sh.
+# ---- Build-time sanity check (fail fast if bindings aren't visible to venv) ----
 RUN PYTHONPATH="/usr/lib/python3/dist-packages:/usr/lib/aarch64-linux-gnu/python3.11/dist-packages:/usr/lib/aarch64-linux-gnu/python3/dist-packages" \
     /opt/venv/bin/python - <<'PY'
 import gnuradio, gnuradio.gr, gnuradio.analog, gnuradio.filter
