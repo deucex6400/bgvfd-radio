@@ -1,11 +1,17 @@
+
 #!/usr/bin/env python3
 # Stereo/VHF Radio Discord Bot — prefix + slash commands
-# Patched: intents, awaited add_cog, presets, slash enabled, robust help
+# Patched: vmcircbuf env, presets fix, tune logging, frequency confirmation, error handler
 
 import sys
 import os
+
+# --- GNU Radio runtime: force a stable, portable circular buffer and reduce log noise ---
+# 'malloc' avoids prefs lookup and Windows-only createfilemapping messages
 os.environ.setdefault('GR_VMCIRCBUF_IMPLEMENTATION', 'malloc')
+# Optional: reduce GNU Radio console logs (set to '1' to re-enable)
 os.environ.setdefault('GR_CONSOLE_LOG_ENABLE', '0')
+
 import time
 import json
 import numpy
@@ -23,7 +29,6 @@ from gnuradio.fft import window
 import osmosdr
 
 # -------------------- Config loading --------------------
-
 def _load_config():
     """Load presets/config from env PRESETS_JSON or /opt/presets.json.
     Supports standard JSON or single-quoted JSON-like strings inside double quotes.
@@ -32,6 +37,7 @@ def _load_config():
     env = os.environ.get('PRESETS_JSON')
     if env:
         try:
+            # If user prefers single quotes inside double quotes, convert to valid JSON
             env_json = env.replace("'", '"') if env.count("'") > env.count('"') else env
             cfg = json.loads(env_json)
         except Exception:
@@ -52,10 +58,10 @@ def _load_config():
             'nfm_deviation_hz': 2500,
             'presets': {
                 'navfire': {'mhz': 154.1075},
-                'navmed':  {'mhz': 154.2350},
-                'fg1':     {'mhz': 155.4000},
-                'fg2':     {'mhz': 155.2950},
-                'so1':     {'mhz': 155.1000}
+                'navmed': {'mhz': 154.2350},
+                'fg1': {'mhz': 155.4000},
+                'fg2': {'mhz': 155.2950},
+                'so1': {'mhz': 155.1000}
             }
         }
     return cfg
@@ -63,7 +69,6 @@ def _load_config():
 CONFIG = _load_config()
 
 # -------------------- GNU Radio helper blocks --------------------
-
 def make_source(sample_rate, center_freq=88_500_000):
     src = osmosdr.source(args='rtl=0')
     src.set_freq_corr(0, 0)
@@ -73,14 +78,12 @@ def make_source(sample_rate, center_freq=88_500_000):
     src.set_if_gain(20, 0)
     src.set_bb_gain(20, 0)
     src.set_antenna("", 0)
-
     # Gentle bring-up for R82xx
     src.set_center_freq(center_freq)
     time.sleep(0.05)
     src.set_bandwidth(2_000_000, 0)
     time.sleep(0.05)
     src.set_sample_rate(sample_rate)
-
     default_gain = CONFIG.get('default_gain')
     if default_gain is not None:
         try:
@@ -91,43 +94,36 @@ def make_source(sample_rate, center_freq=88_500_000):
         src.set_gain(29.7)
     return src
 
-
 def make_resampler_ccc(num, denom):
     return gnuradio.filter.rational_resampler_ccc(
         interpolation=num,
         decimation=denom,
-        taps=[],            # explicit, not None
+        taps=[],  # explicit, not None
         fractional_bw=0.0,
     )
-
 
 def make_resampler_fff(num, denom):
     return gnuradio.filter.rational_resampler_fff(
         interpolation=num,
         decimation=denom,
-        taps=[],            # explicit, not None
+        taps=[],  # explicit, not None
         fractional_bw=0.0,
     )
-
 
 def make_channel_lpf(sample_rate, cutoff_hz, trans_hz):
     taps = firdes.low_pass(1.0, sample_rate, cutoff_hz, trans_hz, window.WIN_HAMMING, 6.76)
     return gnuradio.filter.fir_filter_ccf(1, taps)
 
-
 def make_audio_lpf(sample_rate, cutoff_hz=3500, trans_hz=1500):
     taps = firdes.low_pass(1.0, sample_rate, cutoff_hz, trans_hz, window.WIN_HAMMING, 6.76)
     return gnuradio.filter.fir_filter_fff(1, taps)
 
-
 def make_wfm(input_rate, decim):
     return gnuradio.analog.wfm_rcv(quad_rate=input_rate, audio_decimation=decim)
-
 
 def make_nfm_quadrature_demod(sample_rate, deviation_hz):
     g = float(sample_rate) / (2.0 * numpy.pi * float(deviation_hz))
     return gnuradio.analog.quadrature_demod_cf(g)
-
 
 class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
     def __init__(self):
@@ -136,8 +132,8 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
         self.buffer = []
         self.buffer_len = 0
         self.playback_started = False
-        self.min_buffer = int(48000 * 2 * 2 * 0.06)
-        self.playback_length = int(48000 * 2 * 2 * 0.02)
+        self.min_buffer = int(48000 * 2 * 2 * 0.06)    # ~60ms priming
+        self.playback_length = int(48000 * 2 * 2 * 0.02)  # ~20ms chunks
         self.dtype = numpy.dtype('int16')
         self.dtype_i = numpy.iinfo(self.dtype)
         self.dtype_abs_max = 2 ** (self.dtype_i.bits - 1)
@@ -148,10 +144,10 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
         f = input_items[0]
         if f.size:
             self.last_rms = float(numpy.sqrt(numpy.mean(numpy.clip(f, -1.0, 1.0) ** 2)))
-        buf = self._convert(f)
-        self.buffer_len += len(buf)
-        self.buffer.append(buf)
-        self.playback_started = self.buffer_len > self.min_buffer
+            buf = self._convert(f)
+            self.buffer_len += len(buf)
+            self.buffer.append(buf)
+            self.playback_started = self.buffer_len > self.min_buffer
         return len(f)
 
     def _convert(self, f):
@@ -184,7 +180,6 @@ class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
             i += next_len
         return buf
 
-
 class RadioBlock(gnuradio.gr.top_block):
     def __init__(self):
         gnuradio.gr.top_block.__init__(self, "Discord Radio")
@@ -194,12 +189,10 @@ class RadioBlock(gnuradio.gr.top_block):
         self.wfm_sample_rate = 200_000
         self.wfm_output_rate = self.wfm_sample_rate // 4  # 50 kHz
         self.nfm_deviation_hz = int(CONFIG.get('nfm_deviation_hz', 2500))
-
         # Blocks
         self.source = make_source(self.source_sample_rate)
         self.capture_block = CaptureBlock()
         self.mode = str(CONFIG.get('mode', 'nfm')).lower()
-
         # Build initial chain per mode
         self._build_chain()
 
@@ -212,7 +205,6 @@ class RadioBlock(gnuradio.gr.top_block):
     def _build_chain(self):
         self._disconnect_all()
         self.resamp1 = make_resampler_ccc(1, self.source_sample_rate // self.wfm_sample_rate)  # 12
-
         if self.mode == 'wfm':
             self.wfm = make_wfm(self.wfm_sample_rate, 4)
             self.resamp2 = make_resampler_fff(48, 50)
@@ -222,19 +214,18 @@ class RadioBlock(gnuradio.gr.top_block):
             self.connect((self.resamp2, 0), (self.capture_block, 0))
         else:
             # NFM chain: channel LPF -> quadrature demod -> decimate x4 -> audio LPF -> resample
-            self.chan_lpf = make_channel_lpf(self.wfm_sample_rate, cutoff_hz=6_000, trans_hz=6_000)
+            self.chan_lpf   = make_channel_lpf(self.wfm_sample_rate, cutoff_hz=6_000, trans_hz=6_000)
             self.quad_demod = make_nfm_quadrature_demod(self.wfm_sample_rate, self.nfm_deviation_hz)
-            self.decim4 = make_resampler_fff(1, 4)
-            self.audio_lpf = make_audio_lpf(self.wfm_output_rate, cutoff_hz=3500, trans_hz=1500)
-            self.resamp2 = make_resampler_fff(48, 50)
-
-            self.connect((self.source, 0), (self.resamp1, 0))
-            self.connect((self.resamp1, 0), (self.chan_lpf, 0))
-            self.connect((self.chan_lpf, 0), (self.quad_demod, 0))
-            self.connect((self.quad_demod, 0), (self.decim4, 0))
-            self.connect((self.decim4, 0), (self.audio_lpf, 0))
-            self.connect((self.audio_lpf, 0), (self.resamp2, 0))
-            self.connect((self.resamp2, 0), (self.capture_block, 0))
+            self.decim4     = make_resampler_fff(1, 4)
+            self.audio_lpf  = make_audio_lpf(self.wfm_output_rate, cutoff_hz=3500, trans_hz=1500)
+            self.resamp2    = make_resampler_fff(48, 50)
+            self.connect((self.source,   0), (self.resamp1,   0))
+            self.connect((self.resamp1,  0), (self.chan_lpf,  0))
+            self.connect((self.chan_lpf, 0), (self.quad_demod,0))
+            self.connect((self.quad_demod,0), (self.decim4,   0))
+            self.connect((self.decim4,   0), (self.audio_lpf, 0))
+            self.connect((self.audio_lpf,0), (self.resamp2,   0))
+            self.connect((self.resamp2,  0), (self.capture_block, 0))
 
     def set_mode(self, mode: str):
         m = str(mode).lower()
@@ -249,16 +240,25 @@ class RadioBlock(gnuradio.gr.top_block):
             self.start()
         return True
 
-    def tune(self, freq_hz):
+    def tune(self, freq_hz: int):
+        # Helpful log to confirm actual retune attempts
+        try:
+            print(f"[RADIO] Tuning to {freq_hz/1_000_000:.6f} MHz")
+        except Exception:
+            pass
         self.source.set_center_freq(freq_hz)
         time.sleep(0.03)
         self.source.set_center_freq(freq_hz + 25_000)
         time.sleep(0.02)
         self.source.set_center_freq(freq_hz)
 
+    def get_center_mhz(self) -> float:
+        try:
+            return float(self.source.get_center_freq()) / 1_000_000.0
+        except Exception:
+            return -1.0
 
 # -------------------- Discord bot (prefix + slash) --------------------
-
 intents = discord.Intents.default()
 # Enable Message Content ONLY if you want '!' prefix commands
 intents.message_content = True
@@ -278,18 +278,19 @@ async def on_ready():
     print(f"Logged on as {bot.user} (latency ~{bot.latency*1000:.1f} ms) "
           f"mode={CONFIG.get('mode','nfm')} dev={CONFIG.get('nfm_deviation_hz',2500)} Hz")
 
-# ---------- Prefix Cog ----------
+# -------- Prefix Cog --------
 class BotCommands(discord_commands.Cog):
     def __init__(self, bot, radio):
         self.bot = bot
         self.radio = radio
-
-    # Presets from CONFIG
-    PRESETS = {k: {
-        'mhz': float(v.get('mhz')),
-        'squelch': float(v.get('squelch', CONFIG.get('default_squelch', 0.0))),
-        'gain': v.get('gain', CONFIG.get('default_gain', None)),
-    } for k, v in CONFIG.get('presets', {}).items()}
+        # Presets from CONFIG (FIX: assign to self.PRESETS)
+        self.PRESETS = {
+            k: {
+                'mhz': float(v.get('mhz')),
+                'squelch': float(v.get('squelch', CONFIG.get('default_squelch', 0.0))),
+                'gain': v.get('gain', CONFIG.get('default_gain', None)),
+            } for k, v in CONFIG.get('presets', {}).items()
+        }
 
     async def _ensure_playing(self, ctx):
         vc = ctx.voice_client
@@ -300,8 +301,8 @@ class BotCommands(discord_commands.Cog):
             vc.play(src)
             self.radio.start()
 
-    async def _tune_and_play_ctx(self, ctx, freq_mhz: float, squelch: float | None = None, gain: float | None = None):
-        freq_hz = int(freq_mhz * 1_000_000)
+    async def _tune_and_play_ctx(self, ctx, freq_mhz: float, squelch=None, gain=None):
+        freq_hz = int(float(freq_mhz) * 1_000_000)
         if gain is not None:
             try:
                 self.radio.source.set_gain(float(gain))
@@ -311,7 +312,10 @@ class BotCommands(discord_commands.Cog):
         if squelch is not None:
             self.radio.capture_block.squelch_threshold = float(squelch)
         await self._ensure_playing(ctx)
-        await ctx.send(f"Preset tuned: {freq_mhz:.4f} MHz (mode={self.radio.mode.upper()})")
+        await ctx.send(
+            f"Preset tuned: {float(freq_mhz):.4f} MHz (mode={self.radio.mode.upper()}) "
+            f"→ radio reports {self.radio.get_center_mhz():.6f} MHz"
+        )
 
     # --- Prefix: core ---
     @discord_commands.command()
@@ -336,31 +340,31 @@ class BotCommands(discord_commands.Cog):
     # --- Prefix: presets ---
     @discord_commands.command(aliases=['nf'])
     async def navfire(self, ctx):
-        cfg = self.PRESETS.get('navfire');
+        cfg = self.PRESETS.get('navfire')
         if not cfg: return await ctx.send("Preset 'navfire' not found")
         await self._tune_and_play_ctx(ctx, cfg['mhz'], cfg['squelch'], cfg['gain'])
 
     @discord_commands.command(aliases=['nm'])
     async def navmed(self, ctx):
-        cfg = self.PRESETS.get('navmed');
+        cfg = self.PRESETS.get('navmed')
         if not cfg: return await ctx.send("Preset 'navmed' not found")
         await self._tune_and_play_ctx(ctx, cfg['mhz'], cfg['squelch'], cfg['gain'])
 
     @discord_commands.command()
     async def fg1(self, ctx):
-        cfg = self.PRESETS.get('fg1');
+        cfg = self.PRESETS.get('fg1')
         if not cfg: return await ctx.send("Preset 'fg1' not found")
         await self._tune_and_play_ctx(ctx, cfg['mhz'], cfg['squelch'], cfg['gain'])
 
     @discord_commands.command()
     async def fg2(self, ctx):
-        cfg = self.PRESETS.get('fg2');
+        cfg = self.PRESETS.get('fg2')
         if not cfg: return await ctx.send("Preset 'fg2' not found")
         await self._tune_and_play_ctx(ctx, cfg['mhz'], cfg['squelch'], cfg['gain'])
 
     @discord_commands.command()
     async def so1(self, ctx):
-        cfg = self.PRESETS.get('so1');
+        cfg = self.PRESETS.get('so1')
         if not cfg: return await ctx.send("Preset 'so1' not found")
         await self._tune_and_play_ctx(ctx, cfg['mhz'], cfg['squelch'], cfg['gain'])
 
@@ -405,7 +409,7 @@ class BotCommands(discord_commands.Cog):
         prefix_cmds = [
             "!join #channel",
             "!fm <MHz>",
-            "!navfire | !navmed | !fg1 | !fg2 | !so1",
+            "!navfire  !navmed  !fg1  !fg2  !so1",
             "!vol <0.0-2.0>",
             "!squelch <level>",
             "!gain <dB>",
@@ -415,20 +419,20 @@ class BotCommands(discord_commands.Cog):
         slash_cmds = [
             "/join [channel]",
             "/fm freq_mhz:<number>",
-            "/preset name:<navfire|navmed|fg1|fg2|so1>",
+            "/preset name:<navfire navmed fg1 fg2 so1>",
             "/vol level:<0.0-2.0>",
             "/squelch level:<0.0-0.5>",
             "/gain db:<number>",
-            "/mode name:<nfm|wfm>",
+            "/mode name:<nfm wfm>",
             "/stop",
         ]
         s = ["**BGVFD Radio Bot Help**"]
         if prefix:
             s.append("\n**Prefix commands**\n" + "\n".join(prefix_cmds))
-        s.append("\n**Slash commands**\n" + "\n".join(slash_cmds))
+            s.append("\n**Slash commands**\n" + "\n".join(slash_cmds))
         return "\n".join(s)
 
-# ---------- Slash commands ----------
+# -------- Slash commands --------
 PRESET_CHOICES = [app_commands.Choice(name=k, value=k) for k in CONFIG.get('presets', {}).keys()]
 
 @bot.tree.command(name="join", description="Join a voice channel")
@@ -459,18 +463,23 @@ async def fm_slash(interaction: discord.Interaction, freq_mhz: float):
     if vc and not vc.is_playing():
         vc.play(discord.PCMVolumeTransformer(interaction.client.radio.capture_block))
         interaction.client.radio.start()
-    await interaction.response.send_message(f"Tuning {freq_mhz:.3f} MHz (mode={interaction.client.radio.mode.upper()})")
+    await interaction.response.send_message(
+        f"Tuning {float(freq_mhz):.3f} MHz (mode={interaction.client.radio.mode.upper()}) "
+        f"→ {interaction.client.radio.get_center_mhz():.6f} MHz"
+    )
 
 @bot.tree.command(name="preset", description="Tune to a named preset")
 @app_commands.describe(name="Preset name")
 @app_commands.choices(name=PRESET_CHOICES)
 async def preset_slash(interaction: discord.Interaction, name: app_commands.Choice[str]):
     key = name.value
-    cfg = {k: {
-        'mhz': float(v.get('mhz')),
-        'squelch': float(v.get('squelch', CONFIG.get('default_squelch', 0.0))),
-        'gain': v.get('gain', CONFIG.get('default_gain', None)),
-    } for k, v in CONFIG.get('presets', {}).items()}
+    cfg = {
+        k: {
+            'mhz': float(v.get('mhz')),
+            'squelch': float(v.get('squelch', CONFIG.get('default_squelch', 0.0))),
+            'gain': v.get('gain', CONFIG.get('default_gain', None)),
+        } for k, v in CONFIG.get('presets', {}).items()
+    }
     if key not in cfg:
         await interaction.response.send_message("Unknown preset.", ephemeral=True)
         return
@@ -490,7 +499,10 @@ async def preset_slash(interaction: discord.Interaction, name: app_commands.Choi
     if vc and not vc.is_playing():
         vc.play(discord.PCMVolumeTransformer(interaction.client.radio.capture_block))
         interaction.client.radio.start()
-    await interaction.response.send_message(f"Preset '{key}' tuned to {sel['mhz']:.4f} MHz (squelch={sel['squelch']}, gain={sel['gain']})")
+    await interaction.response.send_message(
+        f"Preset '{key}' tuned to {sel['mhz']:.4f} MHz (squelch={sel['squelch']}, gain={sel['gain']}) "
+        f"→ {interaction.client.radio.get_center_mhz():.6f} MHz"
+    )
 
 @bot.tree.command(name="vol", description="Set output volume (0.0 to 2.0)")
 @app_commands.describe(level="Volume level")
@@ -551,6 +563,16 @@ async def help_slash(interaction: discord.Interaction):
         text = cog._build_help_text(prefix=False)
     await interaction.response.send_message(text, ephemeral=True)
 
+# --- Basic error handler so prefix issues surface in-channel and logs ---
+@bot.event
+async def on_command_error(ctx, error):
+    msg = f"Command error: {error}"
+    try:
+        await ctx.send(msg)
+    except Exception:
+        pass
+    print(msg)
+
 # --- setup_hook: attach radio, add cog (await), sync slash ---
 @bot.event
 async def setup_hook():
@@ -566,17 +588,15 @@ async def setup_hook():
         await bot.tree.sync()
         print("Slash commands synced globally (may take up to an hour to appear)")
 
-# ---------- Main ----------
+# -------------------- Main --------------------
 if __name__ == '__main__':
     token = None
     if len(sys.argv) >= 2:
         token = sys.argv[1]
     else:
         token = os.environ.get('DISCORD_TOKEN')
-
     if not token:
-        print('Usage: stereo_fm.py <DISCORD_BOT_TOKEN>  (or set DISCORD_TOKEN env)')
+        print('Usage: stereo_fm.py <DISCORD_BOT_TOKEN> (or set DISCORD_TOKEN env)')
         sys.exit(2)
-
     # setup_hook will create RadioBlock and add the cog
     bot.run(token)
