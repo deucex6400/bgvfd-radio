@@ -160,9 +160,10 @@ intents.message_content = True  # not required for slash commands
 # Existing Bot construction: add intents=intents
 bot = discord_commands.Bot(
     command_prefix=discord_commands.when_mentioned_or('!'),
-    description='Radio bot with slash commands',
-    intents=intents,  # <-- REQUIRED in discord.py v2+
-    description='BGVFD Radio bot')
+    description='BGVFD Discord Radio Bot',
+    intents=intents  # <-- REQUIRED in discord.py v2+
+)
+
 
 
 @bot.event
