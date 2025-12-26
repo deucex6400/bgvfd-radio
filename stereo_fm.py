@@ -5,6 +5,7 @@ from discord import app_commands
 import gnuradio, gnuradio.analog, gnuradio.audio, gnuradio.filter, gnuradio.gr
 from gnuradio.filter import firdes
 from gnuradio.fft import window
+from gnuradio import blocks
 import osmosdr
 
 os.environ.setdefault('GR_VMCIRCBUF_IMPLEMENTATION', 'malloc')
@@ -28,27 +29,37 @@ def _load_config():
     if cfg is None:
         cfg = {
             'mode':'wx',
-            'default_squelch':0.15,
+            'default_squelch':0.20,
+            'default_gain': 18.0,
             'nfm_deviation_hz':5000,
-            'presets':{'wx6':{'mhz':162.5250}}
+            'presets':{'wx6':{'mhz':162.5250, 'squelch':0.20}}
         }
     return cfg
 CONFIG = _load_config()
 
 # --- helpers ---
 
-def make_source(sample_rate, center_freq=88_500_000):
+def make_source(sample_rate, center_freq=162_525_000):
     s = osmosdr.source(args='rtl=0')
-    s.set_freq_corr(int(CONFIG.get('ppm',0)),0)
+    # Optional PPM
+    try:
+        s.set_freq_corr(int(CONFIG.get('ppm',0)),0)
+    except Exception:
+        pass
     s.set_dc_offset_mode(0,0); s.set_iq_balance_mode(0,0); s.set_gain_mode(False,0)
     s.set_if_gain(20,0); s.set_bb_gain(20,0); s.set_antenna("",0)
-    try:
-        s.set_center_freq(center_freq); time.sleep(0.05); s.set_bandwidth(1_200_000,0); time.sleep(0.05)
-    except Exception: pass
+    # Bring-up: set sample rate first, then center freq + modest bandwidth
     s.set_sample_rate(sample_rate)
     try:
+        s.set_center_freq(center_freq); time.sleep(0.08)
+        s.set_bandwidth(1_200_000,0); time.sleep(0.06)
+    except Exception:
+        pass
+    # Default RF gain
+    try:
         s.set_gain(float(CONFIG.get('default_gain',18.0)))
-    except Exception: pass
+    except Exception:
+        pass
     return s
 
 class CaptureBlock(gnuradio.gr.sync_block, discord.AudioSource):
@@ -92,7 +103,7 @@ class RadioBlock(gnuradio.gr.top_block):
         self.out_rate=self.mid_rate//4 # 64k
         self.nfm_dev=int(CONFIG.get('nfm_deviation_hz',5000))
         self.source=make_source(self.source_sample_rate)
-        self.capture=CaptureBlock(CONFIG.get('default_squelch',0.15))
+        self.capture=CaptureBlock(CONFIG.get('default_squelch',0.20))
         self.mode=str(CONFIG.get('mode','wx')).lower()
         self._build()
     def _disconnect_all(self):
@@ -110,7 +121,12 @@ class RadioBlock(gnuradio.gr.top_block):
         self.chan = None
         self.quad = gnuradio.analog.quadrature_demod_cf(float(self.mid_rate)/(2.0*numpy.pi*float(self.nfm_dev)))
         self.decim4 = gnuradio.filter.rational_resampler_fff(interpolation=1, decimation=4, taps=[], fractional_bw=0.0)
-        self.dc_block = gnuradio.analog.dc_blocker_ff(32, True)
+        # DC blocker (blocks module); fallback HPF if not available
+        try:
+            self.dc_block = blocks.dc_blocker_ff(64, True)
+        except Exception:
+            hp_taps = firdes.high_pass(1.0, self.out_rate, 5.0, 5.0, window.WIN_HAMMING, 6.76)
+            self.dc_block = gnuradio.filter.fir_filter_fff(1, hp_taps)
         self.agc_f = gnuradio.analog.agc2_ff(attack_rate=1e-3, decay_rate=1e-2, reference=0.5, gain=1.0)
         self.audio_lpf = gnuradio.filter.fir_filter_fff(1, firdes.low_pass(1.0, self.out_rate, 5000, 2000, window.WIN_HAMMING, 6.76))
         self.resamp2 = gnuradio.filter.rational_resampler_fff(interpolation=3, decimation=4, taps=[], fractional_bw=0.0)
@@ -137,17 +153,16 @@ class RadioBlock(gnuradio.gr.top_block):
         if was: self.start()
         return True
     def _install_xlating(self, shift_hz, cutoff_hz, trans_hz):
-        # Remove existing channel if present
         if self.chan is not None:
             try: self.disconnect((self.agc_c,0),(self.chan,0))
             except Exception: pass
         taps = firdes.low_pass(1.0, self.mid_rate, cutoff_hz, trans_hz, window.WIN_HAMMING, 6.76)
         self.chan = gnuradio.filter.freq_xlating_fir_filter_ccf(1, taps, shift_hz, self.mid_rate)
         self.connect((self.agc_c,0),(self.chan,0))
-        # rewire into demod
         try:
             self.disconnect((self.agc_c,0),(self.quad,0))
-        except Exception: pass
+        except Exception:
+            pass
         self.connect((self.chan,0),(self.quad,0))
     def tune(self,freq_hz:int):
         target=int(freq_hz)
@@ -158,9 +173,26 @@ class RadioBlock(gnuradio.gr.top_block):
         try:
             self.source.set_bandwidth(0,0)
         except Exception: pass
+        # Robust settle hops
         try:
-            self.source.set_center_freq(tuned_center); time.sleep(0.10)
-        except Exception: pass
+            self.source.set_center_freq(tuned_center); time.sleep(0.12)
+            self.source.set_center_freq(tuned_center+50_000); time.sleep(0.08)
+            self.source.set_center_freq(tuned_center-25_000); time.sleep(0.08)
+            self.source.set_center_freq(tuned_center); time.sleep(0.15)
+        except Exception:
+            pass
+        # Readback/retries
+        for _ in range(4):
+            try:
+                tuned=int(self.source.get_center_freq())
+            except Exception:
+                tuned=-1
+            if tuned>0 and abs(tuned - tuned_center)<=3_000:
+                break
+            try:
+                self.source.set_center_freq(tuned_center); time.sleep(0.10)
+            except Exception:
+                pass
         try:
             self.source.set_bandwidth(1_200_000,0)
         except Exception: pass
@@ -191,7 +223,7 @@ async def on_ready():
 class BotCommands(discord_commands.Cog):
     def __init__(self, bot, radio):
         self.bot=bot; self.radio=radio
-        self.PRESETS={k:{'mhz':float(v.get('mhz')), 'squelch': float(v.get('squelch', CONFIG.get('default_squelch',0.15)))} for k,v in CONFIG.get('presets',{}).items()}
+        self.PRESETS={k:{'mhz':float(v.get('mhz')), 'squelch': float(v.get('squelch', CONFIG.get('default_squelch',0.20)))} for k,v in CONFIG.get('presets',{}).items()}
     async def _ensure(self, ctx):
         vc=ctx.voice_client
         if vc is None and ctx.author.voice:
@@ -207,7 +239,7 @@ class BotCommands(discord_commands.Cog):
     @discord_commands.command()
     async def wx(self, ctx):
         self.radio.set_mode('wx')
-        sel=self.PRESETS.get('wx6', {'mhz':162.5250,'squelch':0.15})
+        sel=self.PRESETS.get('wx6', {'mhz':162.5250,'squelch':0.20})
         await self._go(ctx, sel['mhz'], sel['squelch'])
     @discord_commands.command()
     async def fm(self, ctx, *, freq):
@@ -250,5 +282,5 @@ async def on_command_error(ctx,error):
 if __name__=='__main__':
     token=sys.argv[1] if len(sys.argv)>=2 else os.environ.get('DISCORD_TOKEN')
     if not token:
-        print('Usage: stereo_fm.wx2.py <DISCORD_BOT_TOKEN> (or set DISCORD_TOKEN env)'); sys.exit(2)
+        print('Usage: stereo_fm.wx3.py <DISCORD_BOT_TOKEN> (or set DISCORD_TOKEN env)'); sys.exit(2)
     bot.run(token)
