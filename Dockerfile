@@ -21,9 +21,12 @@ RUN apt-get update -q && \
         gr-osmosdr \
         libvolk2-dev \
         libvolk2-bin \
+        # Python runtime and venv tooling
         python3 \
         python3-dev \
         python3-pip \
+        python3-venv \
+        # Voice deps
         libffi-dev \
         libnacl-dev \
         libopus0 \
@@ -33,9 +36,11 @@ RUN apt-get update -q && \
 ARG run_volk_profile
 RUN if [ -n "$run_volk_profile" ] ; then volk_profile ; fi
 
-# ---- Python packages (modern stack: discord.py v2 + aiohttp) ----
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    python3 -m pip install --no-cache-dir \
+# ---- Create virtualenv and install Python packages (discord.py v2 + aiohttp) ----
+# Using a venv avoids PEP 668 "externally managed environment" errors.
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    /opt/venv/bin/python -m pip install --no-cache-dir \
         "discord.py[voice]>=2.4,<3.0" \
         "aiohttp>=3.8.5,<3.9" \
         pynacl
@@ -43,11 +48,14 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # ---- App files ----
 WORKDIR /opt
 ADD stereo_fm.py /opt/stereo_fm.py
-ADD presets.json /opt/presets.json
+ADD presets.json /opt/presets.json   # include your presets
 
 # ---- GNU Radio runtime tuning ----
 ENV GR_VMCIRCBUF_IMPLEMENTATION=malloc \
     GR_CONSOLE_LOG_ENABLE=0 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    # Make sure the venv Python and scripts are first on PATH
+    PATH="/opt/venv/bin:${PATH}"
 
-ENTRYPOINT ["/usr/bin/python3", "/opt/stereo_fm.py"]
+# ---- Entrypoint uses venv Python ----
+ENTRYPOINT ["/opt/venv/bin/python", "/opt/stereo_fm.py"]
