@@ -48,7 +48,7 @@ RUN python3 -m venv /opt/venv && \
 # ---- App files ----
 WORKDIR /opt
 ADD stereo_fm.py /opt/stereo_fm.py
-ADD presets.json /opt/presets.json   # include your presets
+ADD presets.json /opt/presets.json
 
 # ---- GNU Radio runtime tuning ----
 ENV GR_VMCIRCBUF_IMPLEMENTATION=malloc \
